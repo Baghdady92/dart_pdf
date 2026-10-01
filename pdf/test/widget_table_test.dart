@@ -326,8 +326,440 @@ void main() {
     expect(table.box!.height, closeTo(3 * 16.341796875, 0.001));
   });
 
+  group('a decorated row', () {
+    Future<String> build(List<TableRow> rows) async {
+      final document = Document(compress: false);
+      document.addPage(
+        Page(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) => Table(children: rows),
+        ),
+      );
+      return String.fromCharCodes(await document.save());
+    }
+
+    TableRow cells(List<String> texts, {BoxDecoration? decoration}) => TableRow(
+      decoration: decoration,
+      children: <Widget>[for (final text in texts) Text(text)],
+    );
+
+    /// Every `re` rectangle, as 'x,y wxh'.
+    List<String> rects(String pdf) =>
+        RegExp(r'([-\d.]+) ([-\d.]+) ([-\d.]+) ([-\d.]+) re')
+            .allMatches(pdf)
+            .map(
+              (RegExpMatch m) =>
+                  '${m.group(1)},${m.group(2)} ${m.group(3)}x${m.group(4)}',
+            )
+            .toList();
+
+    const grey = BoxDecoration(color: PdfColors.grey);
+
+    test('with no children paints a zero-height band', () async {
+      // Both decoration phases seeded the band as y = infinity, h = 0 and lowered
+      // y only inside the children loop, so a row with an empty children list
+      // left y infinite: the stream carried '0 Infinity <w> 0 re' and poppler
+      // dropped everything drawn after it.
+      final pdf = await build(<TableRow>[
+        cells(<String>['a', 'b']),
+        TableRow(decoration: grey, children: const <Widget>[]),
+        cells(<String>['c', 'd']),
+      ]);
+
+      expect(pdf, isNot(contains('Infinity')));
+      expect(pdf, isNot(contains('NaN')));
+
+      // The band sits where layout put the row, with the height layout gave it.
+      expect(rects(pdf), contains('0,13.872 481.88976x0'));
+
+      // And the rows after it are still drawn.
+      expect(
+        RegExp(
+          r'\[\((\w+)\)\]TJ',
+        ).allMatches(pdf).map((RegExpMatch m) => m.group(1)).toList(),
+        <String>['a', 'b', 'c', 'd'],
+      );
+    });
+
+    test('with children is unchanged', () async {
+      final pdf = await build(<TableRow>[
+        cells(<String>['a', 'b'], decoration: grey),
+        cells(<String>['c', 'd'], decoration: grey),
+      ]);
+
+      // The two decoration bands, which are the only full-width rectangles in
+      // the table's own coordinates. The debug paint adds its own boxes.
+      expect(
+        rects(
+          pdf,
+        ).where((String r) => r.endsWith(' 481.88976x13.872')).toList(),
+        <String>['0,13.872 481.88976x13.872', '0,0 481.88976x13.872'],
+      );
+    });
+
+    test('an empty row with no decoration is unchanged', () async {
+      final pdf = await build(<TableRow>[
+        cells(<String>['a', 'b']),
+        TableRow(children: const <Widget>[]),
+        cells(<String>['c', 'd']),
+      ]);
+
+      expect(pdf, isNot(contains('Infinity')));
+      expect(
+        RegExp(
+          r'\[\((\w+)\)\]TJ',
+        ).allMatches(pdf).map((RegExpMatch m) => m.group(1)).toList(),
+        <String>['a', 'b', 'c', 'd'],
+      );
+    });
+  });
+
+  group('a table whose columns all measure zero', () {
+    /// Lay [make] out on an A4 page and hand back the table and the raw PDF.
+    Future<List<Object>> build(Table Function() make) async {
+      late Table table;
+      final document = Document(compress: false);
+      document.addPage(
+        Page(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) => table = make(),
+        ),
+      );
+      final pdf = String.fromCharCodes(await document.save());
+      return <Object>[table, pdf];
+    }
+
+    List<TableRow> emptyCells() => <TableRow>[
+      TableRow(children: <Widget>[SizedBox(), SizedBox()]),
+      TableRow(children: <Widget>[SizedBox(), SizedBox()]),
+    ];
+
+    test('fills the available width instead of dividing by zero', () async {
+      // The widths were scaled as _widths[n] / maxWidth * maxWidth, and with
+      // every column measuring zero that is 0.0/0.0: NaN landed in the widths, in
+      // the table box, in every cell box and in drawRect. Release wrote
+      // 'q 0 0 NaN 0 re W n'.
+      final result = await build(
+        () => Table(border: TableBorder.all(), children: emptyCells()),
+      );
+      final table = result.first as Table;
+
+      expect(result.last, isNot(contains('NaN')));
+      expect(table.box!.width, closeTo(PdfPageFormat.a4.availableWidth, 0.001));
+      expect(table.box!.height.isFinite, isTrue);
+    });
+
+    test('stays zero wide for TableWidth.min', () async {
+      final result = await build(
+        () => Table(
+          tableWidth: TableWidth.min,
+          border: TableBorder.all(),
+          children: emptyCells(),
+        ),
+      );
+
+      expect((result.first as Table).box!.width, 0.0);
+      expect(result.last, isNot(contains('NaN')));
+    });
+
+    test('holds for FixedColumnWidth(0) as well', () async {
+      final result = await build(
+        () => Table(
+          columnWidths: const <int, TableColumnWidth>{
+            0: FixedColumnWidth(0),
+            1: FixedColumnWidth(0),
+          },
+          children: <TableRow>[
+            TableRow(children: <Widget>[Text('a'), Text('b')]),
+          ],
+        ),
+      );
+
+      expect(result.last, isNot(contains('NaN')));
+      expect(
+        (result.first as Table).box!.width,
+        closeTo(PdfPageFormat.a4.availableWidth, 0.001),
+      );
+    });
+
+    test('a table with content is unchanged', () async {
+      final result = await build(
+        () => Table(
+          border: TableBorder.all(),
+          children: <TableRow>[
+            TableRow(children: <Widget>[Text('hello'), Text('world')]),
+          ],
+        ),
+      );
+
+      expect(
+        (result.first as Table).box!.width,
+        closeTo(PdfPageFormat.a4.availableWidth, 0.001),
+      );
+      expect(result.last, isNot(contains('NaN')));
+    });
+  });
+
+  group('the column width solver', () {
+    test('never squeezes a column below its longest word', () async {
+      // The columns were rescaled by one factor with no per-column floor, so an
+      // overflowing table squeezed a short column below the width of one word and
+      // the cell hard-split it: 'ATLANTICA' came out as ATLANTI then CA.
+      late Table table;
+      late double atlantica;
+
+      final document = Document(compress: false);
+      document.addPage(
+        Page(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) {
+            // What one word needs, measured the way the cell measures it.
+            final word = Text('ATLANTICA', style: Theme.of(context).tableCell);
+            word.layout(
+              context.inheritFrom(const MinContentWidth()),
+              const BoxConstraints(),
+            );
+            atlantica = word.box!.width;
+
+            return table = TableHelper.fromTextArray(
+              headers: <String>[
+                'Codigo',
+                'Descricao do Produto ou Servico',
+                'Quantidade',
+                'Situacao',
+              ],
+              data: <List<String>>[
+                <String>[
+                  '1',
+                  'Servico de manutencao preventiva de equipamentos ind',
+                  '10',
+                  'ATLANTICA',
+                ],
+                <String>[
+                  '2',
+                  'Outro servico com uma descricao bastante longa tambem',
+                  '5',
+                  'ATLANTICA',
+                ],
+              ],
+            );
+          },
+        ),
+      );
+      final pdf = String.fromCharCodes(await document.save());
+
+      final cells = table.children[1].children;
+      expect(
+        cells.last.box!.width,
+        greaterThanOrEqualTo(atlantica + 10),
+        reason: 'the word plus the 5pt padding on each side',
+      );
+
+      // And the widths still fill the table exactly.
+      expect(
+        cells.fold<double>(0, (double sum, Widget c) => sum + c.box!.width),
+        closeTo(PdfPageFormat.a4.availableWidth, 0.001),
+      );
+
+      final runs = RegExp(
+        r'\[\(([^)]*)\)\]TJ',
+      ).allMatches(pdf).map((RegExpMatch m) => m.group(1)!).toList();
+      expect(runs, contains('ATLANTICA'));
+      expect(runs, contains('Situacao'));
+      expect(runs, isNot(contains('ATLANTI')));
+    });
+
+    test('leaves a table that fits exactly as it was', () async {
+      for (final width in <TableWidth>[TableWidth.max, TableWidth.min]) {
+        late Table table;
+        final document = Document();
+        document.addPage(
+          Page(
+            pageFormat: PdfPageFormat.a4,
+            build: (Context context) => table = Table(
+              tableWidth: width,
+              children: <TableRow>[
+                TableRow(children: <Widget>[Text('a'), Text('b')]),
+              ],
+            ),
+          ),
+        );
+        await document.save();
+
+        final expected = width == TableWidth.max
+            ? PdfPageFormat.a4.availableWidth / 2
+            : 6.672;
+        for (final cell in table.children.first.children) {
+          expect(cell.box!.width, closeTo(expected, 1e-9), reason: '$width');
+        }
+      }
+    });
+
+    test('completes when not even the minimums fit', () async {
+      late Table table;
+      final document = Document(compress: false);
+      document.addPage(
+        Page(
+          pageFormat: const PdfPageFormat(40, 300, marginAll: 0),
+          build: (Context context) => table = TableHelper.fromTextArray(
+            cellPadding: EdgeInsets.zero,
+            headers: <String>['h1', 'h2', 'h3'],
+            data: <List<String>>[
+              <String>[
+                'Pneumonoultramicroscopic silicovolcanoconiosis',
+                'Antidisestablishmentarianism opposition',
+                'Incomprehensibilities notwithstanding',
+              ],
+            ],
+          ),
+        ),
+      );
+      final pdf = String.fromCharCodes(await document.save());
+
+      final widths = table.children[1].children
+          .map((Widget c) => c.box!.width)
+          .toList();
+      for (final width in widths) {
+        expect(width.isFinite, isTrue);
+        expect(width, greaterThan(0));
+      }
+      expect(widths.reduce((double a, double b) => a + b), closeTo(40, 0.001));
+      expect(pdf, isNot(contains('NaN')));
+    });
+  });
+
+  group('the column measure pass', () {
+    test('runs once, not once per page', () async {
+      // Table cleared its widths and re-measured every cell on every pass, though
+      // the result depends only on maxWidth, the theme and the direction. A
+      // MultiPage whose body is one Table therefore re-measured the whole table
+      // for every page, which made output quadratic in the row count.
+      _CountingCell.unbounded = 0;
+
+      final pdf = Document();
+      pdf.addPage(
+        MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) => <Widget>[
+            Table(
+              children: <TableRow>[
+                for (var row = 0; row < 200; row++)
+                  TableRow(
+                    children: <Widget>[
+                      for (var column = 0; column < 5; column++)
+                        _CountingCell(),
+                    ],
+                  ),
+              ],
+            ),
+          ],
+        ),
+      );
+      await pdf.save();
+
+      // One maximum and one minimum per cell, and no more however many pages
+      // the table takes.
+      expect(_CountingCell.unbounded, 200 * 5 * 2);
+      expect(pdf.document.pdfPageList.pages.length, greaterThan(1));
+    });
+
+    test('is keyed on the width it was measured for', () async {
+      // The same instance on two pages of different widths must get the widths
+      // each page calls for.
+      final table = Table(
+        children: <TableRow>[
+          TableRow(children: <Widget>[Text('a'), Text('b')]),
+        ],
+      );
+
+      final widths = <double>[];
+      for (final width in <double>[400, 200, 400]) {
+        final document = Document();
+        document.addPage(
+          Page(
+            pageFormat: PdfPageFormat(width, 200, marginAll: 0),
+            build: (Context context) => table,
+          ),
+        );
+        await document.save();
+        widths.add(table.box!.width);
+      }
+
+      expect(widths, <double>[400, 200, 400]);
+    });
+
+    test('a table that ends mid-page leaves room for what follows', () async {
+      final pdf = Document();
+      pdf.addPage(
+        MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) => <Widget>[
+            Text('before'),
+            Table(
+              children: <TableRow>[
+                for (var row = 0; row < 5; row++)
+                  TableRow(children: <Widget>[Text('row $row')]),
+              ],
+            ),
+            Text('after'),
+          ],
+        ),
+      );
+      await pdf.save();
+
+      expect(pdf.document.pdfPageList.pages.length, 1);
+    });
+
+    test('a repeating header still appears on every page', () async {
+      final pdf = Document(compress: false);
+      pdf.addPage(
+        MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          header: (Context context) => Text('header'),
+          footer: (Context context) => Text('footer'),
+          build: (Context context) => <Widget>[
+            TableHelper.fromTextArray(
+              headers: <String>['a', 'b'],
+              data: <List<String>>[
+                for (var row = 0; row < 120; row++)
+                  <String>['$row', 'value $row'],
+              ],
+            ),
+          ],
+        ),
+      );
+      final bytes = await pdf.save();
+
+      final pages = pdf.document.pdfPageList.pages.length;
+      expect(pages, greaterThan(1));
+
+      // The repeated header row, once per page.
+      expect(
+        RegExp(r'\[\(a\)\]TJ').allMatches(String.fromCharCodes(bytes)),
+        hasLength(pages),
+      );
+    });
+  });
+
   tearDownAll(() async {
     final file = File('widgets-table.pdf');
     await file.writeAsBytes(await pdf.save());
   });
+}
+
+/// A cell that counts how often it is laid out with an unbounded width.
+class _CountingCell extends Widget {
+  static int unbounded = 0;
+
+  @override
+  void layout(
+    Context context,
+    BoxConstraints constraints, {
+    bool parentUsesSize = false,
+  }) {
+    if (!constraints.hasBoundedWidth) {
+      unbounded++;
+    }
+    box = PdfRect.fromPoints(PdfPoint.zero, const PdfPoint(20, 10));
+  }
 }

@@ -148,6 +148,32 @@ class PdfGraphics {
     }());
   }
 
+  /// End the current path without painting it.
+  ///
+  /// A path-construction run has to be closed by a painting operator before the
+  /// next one begins, and `n` is the operator that paints nothing. Use it to
+  /// discard a path that has been built and is no longer wanted.
+  void endPath() {
+    var o = 0;
+    assert(() {
+      if (_page.settings.verbose) {
+        o = _buf.offset;
+        _buf.putString(' ' * (_indent));
+      }
+      return true;
+    }());
+
+    _buf.putString('n ');
+
+    assert(() {
+      if (_page.settings.verbose) {
+        _buf.putString(' ' * math.max(0, _commentIndent - _buf.offset + o));
+        _buf.putComment('endPath()');
+      }
+      return true;
+    }());
+  }
+
   /// Draw the contour of the previously defined shape
   void strokePath({bool close = false}) {
     var o = 0;
@@ -320,11 +346,42 @@ class PdfGraphics {
     double? w,
     double? h,
   }) {
+    final bbox = xobj.params['/BBox'] as PdfArray;
+
+    // /BBox is [llx lly urx ury] - ISO 32000-1 8.10.2 - not an origin and a size.
+    // The third and fourth entries were read as the width and the height, so a
+    // form whose box does not start at the origin was scaled by target/urx and
+    // drawn offset by that origin. A reversed box is normalised, as the spec
+    // allows.
+    final x1 = (bbox.values[0] as PdfNum).value.toDouble();
+    final y1 = (bbox.values[1] as PdfNum).value.toDouble();
+    final x2 = (bbox.values[2] as PdfNum).value.toDouble();
+    final y2 = (bbox.values[3] as PdfNum).value.toDouble();
+
+    final llx = math.min(x1, x2);
+    final lly = math.min(y1, y2);
+    final origW = (x2 - x1).abs();
+    final origH = (y2 - y1).abs();
+
+    // A box with no area has nothing to draw, and the division would put an
+    // Infinity operand in the stream.
+    if (origW <= 0 || origH <= 0) {
+      assert(() {
+        if (_page.settings.verbose) {
+          // ignore: avoid_print
+          print(
+            'drawXObject: ${xobj.ref()} has an empty /BBox '
+            '[$x1 $y1 $x2 $y2]; nothing to draw',
+          );
+        }
+        return true;
+      }());
+
+      return;
+    }
+
     _page.addXObject(xobj);
     final name = xobj.name;
-    final bbox = xobj.params['/BBox'] as PdfArray;
-    final origW = (bbox.values[2] as PdfNum).value.toDouble();
-    final origH = (bbox.values[3] as PdfNum).value.toDouble();
     final targetW = w ?? origW;
     final targetH = h ?? origH;
 
@@ -341,9 +398,17 @@ class PdfGraphics {
     }());
 
     _buf.putString('q ');
-    PdfNumList(<double>[scaleX, 0, 0, scaleY, x, y]).output(_page, _buf);
+    // The box's lower-left corner lands at (x, y), whatever the box's own origin.
+    PdfNumList(<double>[
+      scaleX,
+      0,
+      0,
+      scaleY,
+      x - scaleX * llx,
+      y - scaleY * lly,
+    ]).output(_page, _buf);
     _buf.putString(' cm ');
-    _buf.putString('/$name Do ');
+    _buf.putString('$name Do ');
     _buf.putString('Q ');
 
     _page.altered = true;
@@ -661,13 +726,26 @@ class PdfGraphics {
   }
 
   /// Sets the color for drawing
+  /// Sets both the fill and the stroke color for drawing
+  ///
+  /// A null colour leaves both alone and writes nothing.
   void setColor(PdfColor? color) {
     setFillColor(color);
     setStrokeColor(color);
   }
 
   /// Sets the fill color for drawing
+  ///
+  /// A null colour leaves the current fill colour alone and writes nothing. The
+  /// signature has always accepted one, and the verbose diagnostics already used
+  /// `color?.toHex()`, but null fell into the RGB branch - 'null is PdfColorCmyk'
+  /// is false - and was dereferenced there, throwing 'Null check operator used on
+  /// a null value' while the document was being built.
   void setFillColor(PdfColor? color) {
+    if (color == null) {
+      return;
+    }
+
     var o = 0;
     assert(() {
       if (_page.settings.verbose) {
@@ -690,7 +768,7 @@ class PdfGraphics {
       _buf.putString(' g ');
     } else {
       PdfNumList(<double>[
-        color!.red,
+        color.red,
         color.green,
         color.blue,
       ]).output(_page, _buf);
@@ -700,7 +778,7 @@ class PdfGraphics {
     assert(() {
       if (_page.settings.verbose) {
         _buf.putString(' ' * math.max(0, _commentIndent - _buf.offset + o));
-        _buf.putComment('setFillColor(${color?.toHex()})');
+        _buf.putComment('setFillColor(${color.toHex()})');
       }
       return true;
     }());
@@ -708,6 +786,10 @@ class PdfGraphics {
 
   /// Sets the stroke color for drawing
   void setStrokeColor(PdfColor? color) {
+    if (color == null) {
+      return;
+    }
+
     var o = 0;
     assert(() {
       if (_page.settings.verbose) {
@@ -730,7 +812,7 @@ class PdfGraphics {
       _buf.putString(' G ');
     } else {
       PdfNumList(<double>[
-        color!.red,
+        color.red,
         color.green,
         color.blue,
       ]).output(_page, _buf);
@@ -740,7 +822,7 @@ class PdfGraphics {
     assert(() {
       if (_page.settings.verbose) {
         _buf.putString(' ' * math.max(0, _commentIndent - _buf.offset + o));
-        _buf.putComment('setStrokeColor(${color?.toHex()})');
+        _buf.putComment('setStrokeColor(${color.toHex()})');
       }
       return true;
     }());
@@ -967,12 +1049,19 @@ class PdfGraphics {
     final x1d = 0.5 * (x1 - x2);
     final y1d = 0.5 * (y1 - y2);
 
+    // One variable holds two different things in turn: first F.6.6's radii ratio,
+    // then F.6.5's centre factor. The out-of-range branch scaled the radii and
+    // then re-assigned the *ratio* without converting it, so it stayed 1.0 where
+    // it has to be 0 - and sqrt(1.0) put the centre a whole radius away from where
+    // it belongs, taking theta, dTheta and every emitted curve with it. Once the
+    // radii have been corrected the ellipse passes through both endpoints exactly,
+    // so the centre factor is zero.
     var r = x1d * x1d / (rx * rx) + y1d * y1d / (ry * ry);
     if (r > 1.0) {
       final rr = math.sqrt(r);
       rx *= rr;
       ry *= rr;
-      r = x1d * x1d / (rx * rx) + y1d * y1d / (ry * ry);
+      r = 0.0;
     } else if (r != 0.0) {
       r = 1.0 / r - 1.0;
     }

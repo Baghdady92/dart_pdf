@@ -519,6 +519,151 @@ void main() {
     );
   });
 
+  group('a zero effective font size', () {
+    /// Lay [child] out and return the raw PDF and the box.
+    Future<List<Object>> build(RichText Function() child) async {
+      late RichText laid;
+      final document = Document(compress: false);
+      document.addPage(
+        Page(
+          pageFormat: PdfPageFormat.a4,
+          build: (Context context) => laid = child(),
+        ),
+      );
+      final pdf = String.fromCharCodes(await document.save());
+      return <Object>[pdf, laid.box!];
+    }
+
+    test('writes no NaN token', () async {
+      // letterSpacing is divided by the effective font size to convert it to font
+      // units, and the division was unguarded: at size 0 it is 0.0/0.0 = NaN,
+      // PdfFontMetrics.append carried that into the advance and the offset, and
+      // drawString emitted it as a Td coordinate. Asserts on threw from PdfNum;
+      // release wrote the bare token where a number belongs.
+      final cases = <String, RichText Function()>{
+        'an embedded font': () =>
+            Text('two words', style: TextStyle(font: ttf, fontSize: 0)),
+        'a standard-14 font': () =>
+            Text('two words', style: const TextStyle(fontSize: 0)),
+        'textScaleFactor 0': () => RichText(
+          textScaleFactor: 0,
+          text: const TextSpan(
+            text: 'two words',
+            style: TextStyle(fontSize: 12),
+          ),
+        ),
+        'with letterSpacing': () => Text(
+          'two words',
+          style: TextStyle(font: ttf, fontSize: 0, letterSpacing: 2),
+        ),
+      };
+
+      for (final entry in cases.entries) {
+        final result = await build(entry.value);
+        expect(result.first, isNot(contains('NaN')), reason: entry.key);
+        expect(result.first, isNot(contains('Infinity')), reason: entry.key);
+      }
+    });
+
+    test('lays out to a finite box', () async {
+      for (final entry in <String, RichText Function()>{
+        'an embedded font': () =>
+            Text('two words', style: TextStyle(font: ttf, fontSize: 0)),
+        'textScaleFactor 0': () => RichText(
+          textScaleFactor: 0,
+          text: const TextSpan(
+            text: 'two words',
+            style: TextStyle(fontSize: 12),
+          ),
+        ),
+      }.entries) {
+        final box = (await build(entry.value)).last as PdfRect;
+        expect(box.width, 0, reason: entry.key);
+        expect(box.height, 0, reason: entry.key);
+      }
+
+      // letterSpacing is an absolute number of points at every size, so a
+      // zero-size run still carries it; what matters is that it stays finite.
+      final spaced =
+          (await build(
+                () => Text(
+                  'two words',
+                  style: TextStyle(font: ttf, fontSize: 0, letterSpacing: 2),
+                ),
+              )).last
+              as PdfRect;
+      expect(spaced.width.isFinite, isTrue);
+      expect(spaced.height, 0);
+    });
+  });
+
+  group('the minimum content width', () {
+    /// The narrowest [widget] can be, and the widest it wants to be.
+    Future<List<double>> widths(Widget widget) async {
+      late double min;
+      late double max;
+
+      final document = Document();
+      document.addPage(
+        Page(
+          build: (Context context) {
+            widget.layout(
+              context.inheritFrom(const MinContentWidth()),
+              const BoxConstraints(),
+            );
+            min = widget.box!.width;
+            widget.layout(context, const BoxConstraints());
+            max = widget.box!.width;
+            return SizedBox();
+          },
+        ),
+      );
+      await document.save();
+
+      return <double>[min, max];
+    }
+
+    test('is the widest piece that cannot be broken', () async {
+      // The table solver needs a floor per column, and this is it: the narrowest
+      // a paragraph can be without a word being cut in half.
+      final oneWord = await widths(Text('hello'));
+      expect(oneWord.first, oneWord.last, reason: 'nothing to break');
+
+      final twoWords = await widths(Text('hello world'));
+      expect(twoWords.first, lessThan(twoWords.last));
+      expect(
+        twoWords.first,
+        (await widths(Text('world'))).first,
+        reason: 'the wider of the two words',
+      );
+
+      // A newline is already a break, so it does not widen the minimum.
+      final newline = await widths(Text('hello\nworldwide'));
+      expect(newline.first, (await widths(Text('worldwide'))).first);
+      expect(newline.first, newline.last);
+    });
+
+    test('counts letterSpacing', () async {
+      final plain = await widths(Text('hello world'));
+      final spaced = await widths(
+        Text('hello world', style: const TextStyle(letterSpacing: 2)),
+      );
+
+      // 'world' is five letters, so four gaps of 2pt.
+      expect(spaced.first, closeTo(plain.first + 8, 1e-9));
+    });
+
+    test('breaks at a hyphen, and keeps the hyphen', () async {
+      final hyphenated = await widths(Text('some-thing'));
+      expect(hyphenated.first, lessThan(hyphenated.last));
+      expect(
+        hyphenated.first,
+        (await widths(Text('some-'))).first,
+        reason: 'the head of the break carries its hyphen',
+      );
+    });
+  });
+
   group('TextStyle.height', () {
     const paragraph =
         'The quick brown fox jumps over the lazy dog and keeps running for a '
