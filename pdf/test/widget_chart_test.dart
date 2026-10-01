@@ -819,6 +819,39 @@ void main() {
     });
   });
 
+  test('a pie legend inside a slice contrasts with it', () async {
+    // The legend reads isDark, which was the inverted getter: flipping both the
+    // getter and this call site together keeps the output byte for byte.
+    final document = Document(compress: false);
+    document.addPage(
+      Page(
+        pageFormat: const PdfPageFormat(400, 400, marginAll: 0),
+        build: (Context context) => Chart(
+          grid: PieGrid(),
+          datasets: <Dataset>[
+            PieDataSet(
+              value: 1,
+              color: PdfColors.yellow,
+              legend: 'light',
+              legendPosition: PieLegendPosition.inside,
+            ),
+            PieDataSet(
+              value: 1,
+              color: PdfColors.blue900,
+              legend: 'dark',
+              legendPosition: PieLegendPosition.inside,
+            ),
+          ],
+        ),
+      ),
+    );
+    final pdf = String.fromCharCodes(await document.save());
+
+    // Black on the light slice, white on the dark one.
+    expect(pdf, contains('0 0 0 rg'));
+    expect(pdf, contains('1 1 1 rg'));
+  });
+
   group('PieChart full circle', () {
     // https://github.com/DavBfr/dart_pdf/issues/1963
     // A full circle is drawn as a move and four curves, while a slice starts
