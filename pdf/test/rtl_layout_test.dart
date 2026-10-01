@@ -981,6 +981,122 @@ void main() {
     );
   });
 
+  // crossAxisCount 3 with no padding and no spacing was the one configuration the
+  // old rtl expression placed correctly. These are the ones it did not.
+  for (final count in <int>[2, 4]) {
+    for (final padded in <bool>[false, true]) {
+      for (final direction in TextDirection.values) {
+        final label = direction == TextDirection.rtl ? 'RTL' : 'LTR';
+        final what =
+            '$label GridView $count columns${padded ? ', padded' : ''}';
+
+        test(
+          'Should render Grid $count columns $label${padded ? ' padded' : ''}',
+          () {
+            pdf.addPage(
+              Page(
+                textDirection: direction,
+                pageFormat: const PdfPageFormat(150, 150),
+                build: (Context context) => TestAnnotation(
+                  anno: what,
+                  child: GridView(
+                    crossAxisCount: count,
+                    childAspectRatio: 1,
+                    direction: Axis.vertical,
+                    crossAxisSpacing: padded ? 4 : 0,
+                    mainAxisSpacing: padded ? 4 : 0,
+                    padding: padded
+                        ? const EdgeInsetsDirectional.only(start: 16, end: 4)
+                        : EdgeInsets.zero,
+                    children: <Widget>[
+                      for (var i = 0; i < count * 2 + 1; i++)
+                        Container(
+                          color: <PdfColor>[
+                            PdfColors.blue,
+                            PdfColors.red,
+                            PdfColors.yellow,
+                          ][i % 3],
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      }
+    }
+  }
+
+  for (final direction in TextDirection.values) {
+    final label = direction == TextDirection.rtl ? 'RTL' : 'LTR';
+
+    test('Should render Table columns $label', () {
+      pdf.addPage(
+        Page(
+          textDirection: direction,
+          pageFormat: const PdfPageFormat(150, 150),
+          build: (Context context) => TestAnnotation(
+            anno: '$label Table columns',
+            child: Table(
+              border: TableBorder.all(),
+              children: <TableRow>[
+                for (var r = 0; r < 3; r++)
+                  TableRow(
+                    children: <Widget>[
+                      for (var c = 0; c < 3; c++)
+                        Container(
+                          padding: const EdgeInsets.all(4),
+                          color: <PdfColor>[
+                            PdfColors.blue100,
+                            PdfColors.red100,
+                            PdfColors.yellow100,
+                          ][c],
+                          child: Text('${r}x$c'),
+                        ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  test('Should render a Table that opts out of mirroring', () {
+    pdf.addPage(
+      Page(
+        textDirection: TextDirection.rtl,
+        pageFormat: const PdfPageFormat(150, 150),
+        build: (Context context) => TestAnnotation(
+          anno: 'RTL page, Table textDirection: ltr',
+          child: Table(
+            textDirection: TextDirection.ltr,
+            border: TableBorder.all(),
+            children: <TableRow>[
+              for (var r = 0; r < 3; r++)
+                TableRow(
+                  children: <Widget>[
+                    for (var c = 0; c < 3; c++)
+                      Container(
+                        padding: const EdgeInsets.all(4),
+                        color: <PdfColor>[
+                          PdfColors.blue100,
+                          PdfColors.red100,
+                          PdfColors.yellow100,
+                        ][c],
+                        child: Text('${r}x$c'),
+                      ),
+                  ],
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  });
+
   test('RTL Stack, should directional child to right44', () {
     pdf.addPage(
       Page(
