@@ -16,6 +16,8 @@
 
 #include "print_job.h"
 
+#include "pdfium_raster.h"
+
 #include <errno.h>
 #include <linux/memfd.h>
 #include <stdio.h>
@@ -28,6 +30,7 @@
 #include <mutex>
 #include <string>
 
+#include <fpdf_formfill.h>
 #include <fpdfview.h>
 
 // PDFium is a process-wide library: only the first job initializes it and
@@ -396,21 +399,130 @@ bool print_job::share_pdf(const uint8_t data[],
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+/// Holds the process-wide pdfium reference for a scope.
+class pdfium_scope {
+ public:
+  pdfium_scope() { acquire_pdfium(); }
+  ~pdfium_scope() { release_pdfium(); }
+
+  pdfium_scope(const pdfium_scope&) = delete;
+  pdfium_scope& operator=(const pdfium_scope&) = delete;
+};
+
+/// Closes a pdfium handle however the scope is left.
+///
+/// The raster loop gained exit paths that must not skip FPDF_ClosePage,
+/// FPDFBitmap_Destroy or the library reference.
+template <typename Handle, void (*Close)(Handle)>
+class pdfium_handle {
+ public:
+  explicit pdfium_handle(Handle handle) : handle_(handle) {}
+  ~pdfium_handle() {
+    if (handle_ != nullptr) {
+      Close(handle_);
+    }
+  }
+
+  pdfium_handle(const pdfium_handle&) = delete;
+  pdfium_handle& operator=(const pdfium_handle&) = delete;
+
+  Handle get() const { return handle_; }
+  explicit operator bool() const { return handle_ != nullptr; }
+
+ private:
+  Handle handle_;
+};
+
+using document_handle = pdfium_handle<FPDF_DOCUMENT, &FPDF_CloseDocument>;
+using page_handle = pdfium_handle<FPDF_PAGE, &FPDF_ClosePage>;
+using bitmap_handle = pdfium_handle<FPDF_BITMAP, &FPDFBitmap_Destroy>;
+
+/// The pdfium form-fill environment for one document.
+///
+/// Widget annotations - checkboxes, text fields, buttons, signatures - keep
+/// their appearance in /AP streams and paint nothing into the page content
+/// stream, and FPDF_RenderPageBitmap draws every annotation except widget and
+/// popup ones. pdfium draws them through FPDF_FFLDraw, which needs this
+/// environment; without it those fields were simply missing, with no error.
+class form_environment {
+ public:
+  explicit form_environment(FPDF_DOCUMENT doc) {
+    // Zeroed first: every member other than the version is an optional callback
+    // this does not need. The struct has to outlive the handle, because pdfium
+    // keeps a pointer to it, which is why it is a member and not a local.
+    memset(&info_, 0, sizeof(info_));
+    info_.version = 2;
+
+    handle_ = FPDFDOC_InitFormFillEnvironment(doc, &info_);
+    if (handle_ != nullptr) {
+      // No selection highlight: this is a render, not an editor.
+      FPDF_SetFormFieldHighlightAlpha(handle_, 0);
+    }
+  }
+
+  ~form_environment() {
+    if (handle_ != nullptr) {
+      FPDFDOC_ExitFormFillEnvironment(handle_);
+    }
+  }
+
+  form_environment(const form_environment&) = delete;
+  form_environment& operator=(const form_environment&) = delete;
+
+  /// Null when pdfium refused the environment, in which case every call on it
+  /// is skipped and the render is exactly what it was before.
+  FPDF_FORMHANDLE get() const { return handle_; }
+
+ private:
+  FPDF_FORMFILLINFO info_;
+  FPDF_FORMHANDLE handle_ = nullptr;
+};
+
+/// Tells the form environment about a page for as long as it is open.
+///
+/// Declared after the page handle, so FORM_OnBeforeClosePage runs before
+/// FPDF_ClosePage.
+class form_page {
+ public:
+  form_page(FPDF_PAGE page, FPDF_FORMHANDLE form) : page_(page), form_(form) {
+    if (page_ != nullptr && form_ != nullptr) {
+      FORM_OnAfterLoadPage(page_, form_);
+    }
+  }
+
+  ~form_page() {
+    if (page_ != nullptr && form_ != nullptr) {
+      FORM_OnBeforeClosePage(page_, form_);
+    }
+  }
+
+  form_page(const form_page&) = delete;
+  form_page& operator=(const form_page&) = delete;
+
+ private:
+  FPDF_PAGE page_;
+  FPDF_FORMHANDLE form_;
+};
+
 void print_job::raster_pdf(const uint8_t data[],
                            size_t size,
                            const int32_t pages[],
                            size_t pages_count,
-                           double scale) {
-  acquire_pdfium();
+                           double scale,
+                           uint32_t background) {
+  const pdfium_scope pdfium;
 
-  auto doc = FPDF_LoadMemDocument64(data, size, nullptr);
+  document_handle doc{FPDF_LoadMemDocument64(data, size, nullptr)};
   if (!doc) {
-    release_pdfium();
     on_page_raster_end(this, "Cannot raster a malformed PDF file");
     return;
   }
 
-  auto pageCount = FPDF_GetPageCount(doc);
+  // Null when this document has no AcroForm, or pdfium refused: every call on
+  // it below is then skipped and the render is unchanged.
+  const form_environment form{doc.get()};
+
+  auto pageCount = FPDF_GetPageCount(doc.get());
   auto allPages = false;
 
   if (pages_count == 0) {
@@ -418,53 +530,62 @@ void print_job::raster_pdf(const uint8_t data[],
     pages_count = pageCount;
   }
 
-  for (auto pn = 0; pn < pages_count; pn++) {
-    auto n = allPages ? pn : pages[pn];
+  for (size_t pn = 0; pn < pages_count; pn++) {
+    auto n = allPages ? static_cast<int32_t>(pn) : pages[pn];
     if (n >= pageCount) {
       continue;
     }
 
-    auto page = FPDF_LoadPage(doc, n);
+    page_handle page{FPDF_LoadPage(doc.get(), n)};
     if (!page) {
       continue;
     }
+    const form_page formPage{page.get(), form.get()};
 
-    auto width = FPDF_GetPageWidth(page);
-    auto height = FPDF_GetPageHeight(page);
-
-    auto bWidth = static_cast<int>(width * scale);
-    auto bHeight = static_cast<int>(height * scale);
-
-    auto bitmap = FPDFBitmap_Create(bWidth, bHeight, 1);
-    FPDFBitmap_FillRect(bitmap, 0, 0, bWidth, bHeight, 0x00ffffff);
-
-    FPDF_RenderPageBitmap(bitmap, page, 0, 0, bWidth, bHeight, 0,
-                          FPDF_ANNOT | FPDF_LCD_TEXT | FPDF_NO_NATIVETEXT);
-
-    uint8_t* p = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bitmap));
-    auto stride = FPDFBitmap_GetStride(bitmap);
-    size_t l = static_cast<size_t>(bHeight * stride);
-
-    // BGRA to RGBA conversion
-    for (auto y = 0; y < bHeight; y++) {
-      auto offset = y * stride;
-      for (auto x = 0; x < bWidth; x++) {
-        auto t = p[offset];
-        p[offset] = p[offset + 2];
-        p[offset + 2] = t;
-        offset += 4;
-      }
+    const auto raster = nfet::rasterSizeFor(
+        FPDF_GetPageWidth(page.get()), FPDF_GetPageHeight(page.get()), scale);
+    if (!raster.valid) {
+      // pdfium answers a null bitmap for this, which the loop below used to
+      // write through.
+      on_page_raster_end(this, "Cannot raster a page this large");
+      return;
     }
 
-    on_page_rasterized(this, p, l, bWidth, bHeight);
+    bitmap_handle bitmap{FPDFBitmap_Create(raster.width, raster.height, 1)};
+    if (!bitmap) {
+      on_page_raster_end(this, "Out of memory rastering a page");
+      return;
+    }
 
-    FPDFBitmap_Destroy(bitmap);
-    FPDF_ClosePage(page);
+    // A PDF page has no background of its own. This used to be hard-coded to
+    // 0x00ffffff, which writes white but leaves alpha at 0, so a rastered page
+    // came back transparent and saving it as PNG gave a black page.
+    FPDFBitmap_FillRect(bitmap.get(), 0, 0, raster.width, raster.height,
+                        static_cast<unsigned long>(background));
+
+    FPDF_RenderPageBitmap(bitmap.get(), page.get(), 0, 0, raster.width,
+                          raster.height, 0,
+                          FPDF_ANNOT | FPDF_LCD_TEXT | FPDF_NO_NATIVETEXT);
+
+    if (form.get() != nullptr) {
+      // A second pass over the same bitmap, for the annotations the content
+      // stream does not carry.
+      FPDF_FFLDraw(form.get(), bitmap.get(), page.get(), 0, 0, raster.width,
+                   raster.height, 0,
+                   FPDF_ANNOT | FPDF_LCD_TEXT | FPDF_NO_NATIVETEXT);
+    }
+
+    uint8_t* p = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bitmap.get()));
+    if (p == nullptr) {
+      on_page_raster_end(this, "Unable to read the rastered page");
+      return;
+    }
+
+    nfet::bgraToPremultipliedRgba(p, raster.width, raster.height,
+                                  raster.stride);
+
+    on_page_rasterized(this, p, raster.bytes, raster.width, raster.height);
   }
-
-  FPDF_CloseDocument(doc);
-
-  release_pdfium();
 
   on_page_raster_end(this, nullptr);
 }

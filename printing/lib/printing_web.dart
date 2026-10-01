@@ -18,7 +18,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:js_interop' as js;
 import 'dart:js_interop_unsafe' as js;
-import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
@@ -36,6 +35,7 @@ import 'src/pdfjs_urls.dart';
 import 'src/printer.dart';
 import 'src/printing_info.dart';
 import 'src/raster.dart';
+import 'src/web_blob.dart';
 import 'src/web_print_policy.dart';
 
 const _dartPdfJsVersion = 'dartPdfJsVersion';
@@ -410,6 +410,13 @@ class PrintingPlugin extends PrintingPlatform {
     return completer.future;
   }
 
+  /// An ARGB int as the `rgba()` string pdf.js wants for its page backdrop.
+  static String _cssColor(int argb) {
+    final alpha = ((argb >> 24) & 0xff) / 255;
+    return 'rgba(${(argb >> 16) & 0xff},${(argb >> 8) & 0xff},'
+        '${argb & 0xff},$alpha)';
+  }
+
   void _revokeLastPrintUrl() {
     final url = _lastPrintUrl;
     if (url != null) {
@@ -482,8 +489,9 @@ class PrintingPlugin extends PrintingPlatform {
   Stream<PdfRaster> raster(
     Uint8List document,
     List<int>? pages,
-    double dpi,
-  ) async* {
+    double dpi, {
+    int background = 0xffffffff,
+  }) async* {
     await _initPlugin();
 
     // pdf.js 4+ transfers TypedArrays to the worker and takes ownership of the
@@ -525,12 +533,15 @@ class PrintingPlugin extends PrintingPlatform {
 
           final renderContext = Settings()
             ..canvasContext = context
-            ..viewport = viewport;
+            ..viewport = viewport
+            // pdf.js filled its canvas opaque white whatever the caller asked
+            // for, which is why web was the one backend that did not come back
+            // transparent. Now it is the caller's choice on every backend.
+            ..background = _cssColor(background);
 
           await page.render(renderContext).promise.toDart;
 
           // Convert the image to PNG
-          final completer = Completer<void>();
           final blobCompleter = Completer<web.Blob?>();
           canvas.toBlob(
             // ignore: unnecessary_lambdas
@@ -538,21 +549,21 @@ class PrintingPlugin extends PrintingPlatform {
               blobCompleter.complete(blob);
             }.toJS,
           );
+
           final blob = await blobCompleter.future;
           if (blob == null) {
-            continue;
+            // This used to `continue`, so the page was silently missing from
+            // the stream with nothing to say why.
+            throw Exception('Unable to encode page ${pageIndex + 1}');
           }
-          final data = BytesBuilder();
-          final r = web.FileReader();
-          r.readAsArrayBuffer(blob);
 
-          r.onLoadEnd.listen((web.ProgressEvent e) {
-            data.add((r.result! as js.JSArrayBuffer).toDart.asInt8List());
-            completer.complete();
-          });
-          await completer.future;
-
-          yield _WebPdfRaster(canvas.width, canvas.height, data.toBytes());
+          // Each iteration now either yields a page or throws; nothing here
+          // awaits something that has no completion path.
+          yield _WebPdfRaster(
+            canvas.width,
+            canvas.height,
+            await blobToBytes(blob),
+          );
         } finally {
           page.cleanup();
         }

@@ -1,5 +1,26 @@
 # Changelog
 
+## 5.18.0
+
+- **`Printing.raster` now paints an opaque white page backdrop.** A PDF page has no background of its own - the imaging model leaves it to whatever displays the document - and no native backend painted one, so 96% of a blank A4 came back at alpha 0 and saving a rastered page as PNG, or re-encoding it as JPEG, gave a black page. Pass `background: 0x00000000` to `Printing.raster` for the transparent pages of 5.17 and earlier
+- Fix Windows and Linux handing back straight alpha where Flutter reads premultiplied, so a partially transparent page rastered too bright. It made no difference while every pixel was transparent, and none for the new opaque default
+- `PrintingPlatform.raster` gained a `background` parameter, which a custom platform implementation has to accept
+- **Fix `Printing.raster` hard-crashing the whole process on Windows and Linux** for a page too large to rasterize - an A0 at 600 dpi, an A4 at 3400 dpi. pdfium answers a null bitmap once the buffer reaches 4 GiB, and the pixel loop wrote straight through it; the buffer length and the row offsets were also computed in `int`, which wraps above 2 GiB. The stream now ends with an error naming the problem and the app stays alive
+- Every pdfium handle on the Windows and Linux raster paths is released by a scope guard, so the new failure exits cannot skip a close
+- Fix the web raster hanging for ever when a page's blob could not be read or the read was aborted: the `FileReader` listener completed its completer only on the success path, and its failure went to the zone rather than to the awaiting code, so `Printing.raster` stopped emitting and never closed and `PdfPreview` sat on a spinner with no error. The read now reports a failure on the stream
+- Fix the web raster silently dropping a page when the canvas could not be encoded; it reports which page instead
+- Fix the Android raster leaking a full-size temp file in the app cache, two file descriptors and a native `PdfRenderer` on every failure - a password-protected, truncated or malformed document, or an out-of-range page index - which also tripped StrictMode. Every handle is now released on every path, and the temp file is deleted last rather than on the line after the constructor that threw
+- An out-of-range page index on Android now ends the raster stream with a message naming the index and the page count, instead of an uncaught `IllegalArgumentException`
+- A failed Android raster always reports a non-null message. It could report null, which the Dart side reads as a clean end of stream, and it could report twice
+- Fix `PdfRaster.toPng` abandoning the `ui.Image` it decodes, so every page of every preview re-raster left a full-resolution decode in engine memory. `PdfRaster.toImage` still hands its image to the caller, which its documentation now says
+- `PdfRaster.toPng` reports a failure to encode instead of a null-check error
+- Fix AcroForm widget annotations - checkboxes, text fields, buttons, signatures - being absent from the Windows and Linux preview raster and from Windows printed output, while the same document shows them in any viewer. The raster paths now draw them through a pdfium form-fill environment, and the Windows print path flattens them into the page, which keeps the output vector
+
+
+
+
+
+
 ## 5.17.0
 
 - Fix self-hosting pdf.js on web never loading, with 'Failed to resolve module specifier'. A dynamic `import()` reads its argument as a module specifier, so the relative `dartPdfJsBaseUrl` the README documented was a bare specifier the browser rejected. The configured base is now resolved against the page - honouring `<base href>` - and given a trailing slash
