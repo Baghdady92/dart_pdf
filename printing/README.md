@@ -56,14 +56,29 @@ for documentation.
 
     ```html
     <script>
-      var dartPdfJsBaseUrl = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.2.146/";
+      var dartPdfJsBaseUrl = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.2.108/build/";
     </script>
    ```
-    It is possible to use local directory which will be resolved to the host where the web app is running.
+    The directory must contain `pdf.min.mjs` and `pdf.worker.min.mjs`: Pdf.js 4 and
+    later ship ES modules only, so a copy holding just the older `*.js` files will
+    not load.
+
+    It is possible to use a local directory, which is resolved against the page the
+    web app is served from.
 
     ```html
     <script>
-      var dartPdfJsBaseUrl = "assets/js/pdf/3.2.146/";
+      var dartPdfJsBaseUrl = "assets/js/pdf/6.2.108/";
+    </script>
+   ```
+    A self-hosted copy that has to render PDFs whose CID fonts use a predefined CMap
+    (`UniJIS-UCS2-H`, `GBK-EUC-H` and the like) also needs `pdfjs-dist`'s `cmaps/`
+    directory. By default it is looked for next to the library, at
+    `<dartPdfJsBaseUrl>cmaps/`; set `dartPdfJsCMapUrl` if it lives somewhere else.
+
+    ```html
+    <script>
+      var dartPdfJsCMapUrl = "assets/js/cmaps/";
     </script>
    ```
 
@@ -135,6 +150,13 @@ You can also print the document using the iOS or Android print service:
 await Printing.layoutPdf(
       onLayout: (PdfPageFormat format) async => doc.save());
 ```
+
+`layoutPdf` returns true when the document was printed and false when it was
+cancelled, except on the web: no browser reports whether the user printed or
+cancelled, so there a true result only means the browser's print dialog was
+invoked. `Printing.info().reportsPrintOutcome` is false on the web to say so. A
+browser that cannot print from a hidden frame - Android Chrome, and any web
+view - is handed the document as a download instead, and that returns false.
 
 Or share the document to other applications:
 

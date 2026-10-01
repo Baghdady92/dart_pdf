@@ -1,5 +1,41 @@
 # Changelog
 
+## 5.17.0
+
+- Fix self-hosting pdf.js on web never loading, with 'Failed to resolve module specifier'. A dynamic `import()` reads its argument as a module specifier, so the relative `dartPdfJsBaseUrl` the README documented was a bare specifier the browser rejected. The configured base is now resolved against the page - honouring `<base href>` - and given a trailing slash
+- Fix text disappearing on web from PDFs whose CID fonts use a predefined CMap (`UniJIS-UCS2-H`, `GBK-EUC-H`). The CMap configuration was behind a condition that was never true, and the URL it would have built was a 404: `pdfjs-dist` keeps `cmaps/` beside `build/`, not inside it
+- A self-hoster whose `cmaps/` directory is not next to the library can point at it with a new `dartPdfJsCMapUrl` window variable
+- Configuration values from the page are escaped before being interpolated into the loader script, so a quote in one of them is no longer a syntax error
+- The README's pdf.js instructions named version 3.2.146 and the `*.js` loader files, neither of which works with the ES-module pdf.js this package requests
+- **`Printing.layoutPdf` on web no longer returns true unconditionally.** It returns false when nothing reached a print dialog: the browser refused to print the frame, the document never loaded, or the browser was handed a download instead. Apps that marked invoices printed, popped a route or showed success off that value were doing so after a cancel, after a failure and after a popup-blocked download
+- Fix mobile browsers never attempting to print on web. The strategy is chosen from the browser engine rather than the `Mobile` user-agent token, so an iPhone and an iPad - which sends a desktop user agent - now behave the same instead of one printing and the other silently doing nothing
+- The web download fallback now sets the anchor's `download` attribute with the job name instead of `target=_blank`, which iOS Safari blocks when it is clicked after an await. **On Android and in web views, printing on web now downloads the document rather than opening a tab**
+- `PrintingInfo` gained `reportsPrintOutcome`, false on web, for an app that treats a print as a committed action
+- Fix the web print path leaving the print iframe, its helper script and a full copy of the document in the page whenever the browser's `print()` returned promptly, and never revoking any blob object URL it created. Every print, share and download used to retain the whole document for the lifetime of the tab
+- The web print future no longer resolves while the print dialog is still open, and completes false instead of hanging when the browser will not render the document at all
+- Fix `PdfPreview` dropping a page format, orientation or debug-switch change made while pages were still streaming. The action bar showed the new setting while the preview kept the old rendering until some unrelated event happened to re-raster. Requests made during a raster now coalesce into one catch-up pass that renders the newest of them
+- Fix `PdfPreview` re-running the app's whole document build and a full raster pass on any inherited-widget change - opening the keyboard, toggling dark mode, changing the text scale - even though only the size and the device pixel ratio can move the resolution it renders at
+- `PdfPreview` now re-rasters when the window is resized, which it did not do at all
+- `PdfPreviewRaster` gained a protected `computeDpi()` and a `needsRasterForDpi` getter, for a subclass that overrides the scheduling
+- Fix `PdfPreview` throwing `RangeError` out of `build` - a red error widget the user cannot recover from - when a page was zoomed and a re-raster then produced fewer pages. The zoomed page is clamped to the last page there is, or leaves the zoom when the document is empty, and `onZoomChanged` fires exactly once per real change
+- Fix `PdfPreview` re-inflating every page on every rebuild with `enableScrollToPage: true`, which made streaming a document cost O(N^2), and made a key from `getPageKey` dead one frame later. Page keys are now stable for the life of the page
+- Fix `scrollToPage` and `getPageKey` throwing `RangeError (length): Valid value range is empty: 0` when called before the first page was rasterized, or past the end after the document shrank. `scrollToPage` now completes without scrolling, and both assert in debug with the index and the page count
+- `PdfPreviewCustomState` gained a `pageCount` getter, and `PdfPreviewRaster` a protected `onPagesChanged()` hook called before each page-list change is published
+- Fix a change to `PdfPreview`'s `pages`, `dpi` or `maxPageWidth` having no effect until some unrelated event happened to re-raster, at which point the view jumped. Only apps passing `build` as a stable tear-off were affected: a closure literal masked it, because its identity differs on every rebuild. `pages` is compared by content, so a fresh list with the same contents still does not re-raster
+- Fix `PdfPreview.onPageFormatChanged` never firing again after the first parent rebuild, so a persisted paper-size choice silently stopped being saved. The replaced `PdfPreviewData` is now also disposed rather than leaked, and the selected format survives the swap
+- Fix `PdfPreview` leaking one `ScrollController` per mount, with its listener list. The scroll-position restore scheduled from `build` is guarded, so disposing the controller cannot turn that leak into a 'used after being disposed' crash
+- `PdfPreviewCustomState.previewUpdate` is deprecated: it was always null and nothing wrote to it
+- **A failed font download now reaches the caller.** `PdfGoogleFonts.*` and `DownloadableFont.getFont` used to return Helvetica on any failure, with their only report inside an assert that release and profile builds strip - so a release build silently shipped a document in which every rune outside 0x00-0xFF was a crossed box. To keep the old behaviour, set `DownloadableFont.defaultFallback = Font.helvetica()` once, or pass `fallback:` to `getFont`; the substitution is then reported through `FlutterError.reportError` in every build mode
+- A downloaded body that is not a font - a captive portal's sign-in page, a truncated response - is now a font error naming the font and the URL, and is dropped from the cache, instead of a `RangeError` from inside the TTF reader much later
+- `DownloadableFont` is exported, so an app can use it for its own font URLs and set the fallback
+- Fix `flutterImageProvider` never completing when the pixel read-back fails, which on the web is what a `NetworkImage` served without CORS headers does: the preview span for ever, `layoutPdf` and `sharePdf` never fired, and no error reached the app. It now rejects with the read-back's own exception, and with a descriptive one naming the image size when the read-back yields no bytes
+- A `flutterImageProvider` load failure now rejects with the exception and its stack rather than the string 'image failed to load', and its listener is removed on every path
+- Requires pdf_widget_wrapper 1.0.5, in which `WidgetWrapper.fromWidget` works in release and profile builds instead of always throwing, and neither factory leaks its render pipeline or its captured image
+
+
+
+
+
 ## 5.16.0
 
 - Fix roll and undefined page formats sending `double.infinity` over the method channel, which no platform can represent: Android substituted its unknown-size sentinel and laid the document out for Letter, iOS produced NaN margins that ended up as a `NaN` MediaBox, and Windows cast the length into a negative 16-bit field. An unspecified axis is now sent as `0`, meaning 'use the printer's paper for this axis', and each backend treats it that way
