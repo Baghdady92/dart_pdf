@@ -16,6 +16,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdf/pdf.dart';
@@ -31,6 +32,7 @@ void main() {
   late MethodChannelPrinting impl;
   late List<MethodCall> calls;
   late Set<String> failing;
+  late Map<String, Object?> replies;
 
   // A platform -> Dart call, returning the reply envelope so a test can check
   // that the handler answered instead of throwing.
@@ -66,13 +68,14 @@ void main() {
     impl = MethodChannelPrinting();
     calls = <MethodCall>[];
     failing = <String>{};
+    replies = <String, Object?>{};
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (MethodCall call) async {
           calls.add(call);
           if (failing.contains(call.method)) {
             throw PlatformException(code: 'error', message: 'boom');
           }
-          return null;
+          return replies[call.method];
         });
   });
 
@@ -229,6 +232,76 @@ void main() {
       expect(layoutCalls, 0);
     });
 
+    // These two pin the contract the native backends have to honour: a job
+    // that ends for any reason sends exactly one onCompleted. They pass
+    // against the Dart code at HEAD; the Linux plugin is what did not send it.
+    test('a cancellation reports false rather than an error', () async {
+      final result = layout((PdfPageFormat format) async => Uint8List(0));
+      await pumpEventQueue();
+
+      // What cancel_job(nullptr) puts on the channel.
+      await fromPlatform('onCompleted', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'completed': false,
+        'error': null,
+      });
+
+      expect(await result, isFalse);
+    });
+
+    test(
+      'a failing onLayout completes with the error the platform sends',
+      () async {
+        final reported = <Object>[];
+        final previousOnError = FlutterError.onError;
+        FlutterError.onError = (FlutterErrorDetails details) =>
+            reported.add(details.exception);
+        addTearDown(() => FlutterError.onError = previousOnError);
+
+        final result = layout(
+          (PdfPageFormat format) async => throw Exception('no document'),
+        );
+        final expectation = expectLater(result, throwsA('no document'));
+        await pumpEventQueue();
+
+        final job = jobOf('printPdf');
+        // The onLayout reply is an error, so nothing is written and the native
+        // side has to end the job itself. Without that onCompleted the future
+        // never settles - which is what the empty Linux cancel_job caused.
+        final reply = await fromPlatform('onLayout', <String, dynamic>{
+          'job': job,
+          'width': 595.0,
+          'height': 842.0,
+          'marginLeft': 0.0,
+          'marginTop': 0.0,
+          'marginRight': 0.0,
+          'marginBottom': 0.0,
+        });
+        expect(
+          () => _codec.decodeEnvelope(reply!),
+          throwsA(
+            isA<PlatformException>().having(
+              (PlatformException e) => e.message,
+              'message',
+              isNotEmpty,
+            ),
+          ),
+          // Android puts this text in the print dialog through
+          // onLayoutFailed, so an empty message would leave the user with a
+          // blank error.
+          reason: 'the platform sees a failed onLayout, with a message',
+        );
+        expect(reported, hasLength(1), reason: 'the build failure is reported');
+
+        await fromPlatform('onCompleted', <String, dynamic>{
+          'job': job,
+          'completed': false,
+          'error': 'no document',
+        });
+        await expectation;
+      },
+    );
+
     test(
       'unregisters the job when the platform reports it completed',
       () async {
@@ -255,7 +328,167 @@ void main() {
     );
   });
 
+  group('page format', () {
+    test('an unspecified axis crosses the channel as zero', () async {
+      unawaited(
+        impl
+            .layoutPdf(
+              null,
+              (PdfPageFormat format) async => Uint8List(0),
+              'document',
+              PdfPageFormat.roll80,
+              true,
+              false,
+              OutputType.generic,
+              false,
+              false,
+            )
+            .catchError((Object _) => false),
+      );
+      await pumpEventQueue();
+
+      final call = calls.lastWhere((MethodCall c) => c.method == 'printPdf');
+      expect(call.arguments['width'], closeTo(80 * PdfPageFormat.mm, 1e-6));
+      expect(
+        call.arguments['height'],
+        0.0,
+        reason: 'infinity cannot cross the channel',
+      );
+      for (final key in <String>[
+        'marginLeft',
+        'marginTop',
+        'marginRight',
+        'marginBottom',
+      ]) {
+        expect((call.arguments[key] as double).isFinite, isTrue);
+      }
+
+      await fromPlatform('onCompleted', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'completed': false,
+      });
+    });
+
+    test('a non-finite size reported back is repaired', () async {
+      PdfPageFormat? received;
+      unawaited(
+        impl
+            .layoutPdf(
+              null,
+              (PdfPageFormat format) async {
+                received = format;
+                return Uint8List(0);
+              },
+              'document',
+              PdfPageFormat.roll80,
+              true,
+              false,
+              OutputType.generic,
+              false,
+              false,
+            )
+            .catchError((Object _) => false),
+      );
+      await pumpEventQueue();
+
+      // What a backend that mishandled the unspecified axis sends: iOS used to
+      // produce NaN margins this way, and the document got a NaN MediaBox.
+      await fromPlatform('onLayout', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'width': 226.77,
+        'height': double.infinity,
+        'marginLeft': 14.17,
+        'marginTop': 14.17,
+        'marginRight': double.nan,
+        'marginBottom': double.nan,
+      });
+
+      expect(received, isNotNull);
+      expect(received!.width, closeTo(226.77, 1e-6));
+      // An infinite height is meaningful for a roll - the page auto-sizes to
+      // its content - but a NaN margin used to poison that computation and put
+      // a NaN MediaBox in the document.
+      expect(received!.height.isNaN, isFalse);
+      expect(received!.marginRight, 0);
+      expect(received!.marginBottom, 0);
+
+      await fromPlatform('onCompleted', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'completed': false,
+      });
+    });
+
+    test(
+      'a bogus size reported back falls back to the requested one',
+      () async {
+        PdfPageFormat? received;
+        unawaited(
+          impl
+              .layoutPdf(
+                null,
+                (PdfPageFormat format) async {
+                  received = format;
+                  return Uint8List(0);
+                },
+                'document',
+                PdfPageFormat.a4,
+                true,
+                false,
+                OutputType.generic,
+                false,
+                false,
+              )
+              .catchError((Object _) => false),
+        );
+        await pumpEventQueue();
+
+        await fromPlatform('onLayout', <String, dynamic>{
+          'job': jobOf('printPdf'),
+          'width': double.nan,
+          'height': double.nan,
+          'marginLeft': 0.0,
+          'marginTop': 0.0,
+          'marginRight': 0.0,
+          'marginBottom': 0.0,
+        });
+
+        expect(received, isNotNull);
+        expect(received!.width, PdfPageFormat.a4.width);
+        expect(received!.height, PdfPageFormat.a4.height);
+
+        await fromPlatform('onCompleted', <String, dynamic>{
+          'job': jobOf('printPdf'),
+          'completed': false,
+        });
+      },
+    );
+  });
+
   group('convertHtml', () {
+    test('the page format crosses the channel as size and margins', () async {
+      // macOS builds its NSPrintInfo from these, so a missing margin is a
+      // page that ignores the requested format.
+      const format = PdfPageFormat(595, 842, marginAll: 20);
+      final result = impl.convertHtml('<p>x</p>', null, format);
+      final expectation = expectLater(result, throwsA('done'));
+      await pumpEventQueue();
+
+      final args = calls.last.arguments;
+      expect(args['width'], 595.0);
+      expect(args['height'], 842.0);
+      expect(args['marginLeft'], 20.0);
+      expect(args['marginTop'], 20.0);
+      expect(args['marginRight'], 20.0);
+      expect(args['marginBottom'], 20.0);
+      expect(args['html'], '<p>x</p>');
+
+      await fromPlatform('onHtmlError', <String, dynamic>{
+        'job': jobOf('convertHtml'),
+        'error': 'done',
+      });
+      await expectation;
+    });
+
     test('unregisters the job when the platform reports onHtmlError', () async {
       final pending = MethodChannelPrinting.pendingJobs;
       final result = impl.convertHtml('<p>x</p>', null, PdfPageFormat.a4);
@@ -340,6 +573,209 @@ void main() {
 
       expect(await result, <int>[1, 2]);
       expect(MethodChannelPrinting.pendingJobs, pending);
+    });
+  });
+
+  group('sharePdf', () {
+    const bounds = Rect.fromLTRB(0, 0, 1, 1);
+
+    test('a missing reply is a failure, not a success', () async {
+      // The platform answers nothing at all - an unimplemented backend, or one
+      // that returned before deciding. That is not a share.
+      expect(
+        await impl.sharePdf(Uint8List(0), 'x.pdf', bounds, null, null, null),
+        isFalse,
+      );
+    });
+
+    test('a zero reply is a failure', () async {
+      replies['sharePdf'] = 0;
+      expect(
+        await impl.sharePdf(Uint8List(0), 'x.pdf', bounds, null, null, null),
+        isFalse,
+      );
+    });
+
+    test('a non-zero reply is a success', () async {
+      replies['sharePdf'] = 1;
+      expect(
+        await impl.sharePdf(Uint8List(0), 'x.pdf', bounds, null, null, null),
+        isTrue,
+      );
+    });
+
+    test('the name that crosses the channel carries no directory', () async {
+      replies['sharePdf'] = 1;
+
+      await Printing.sharePdf(
+        bytes: Uint8List(0),
+        filename: '../../../etc/passwd.pdf',
+        bounds: Rect.fromLTRB(0, 0, 1, 1),
+      );
+
+      // Every backend joins this onto a temp directory, so a separator used to
+      // point outside it.
+      expect(calls.last.arguments['name'], 'passwd.pdf');
+    });
+
+    group('safeFilename', () {
+      test('keeps an ordinary name', () {
+        expect(Printing.safeFilename('report.pdf'), 'report.pdf');
+      });
+
+      test('drops a posix directory', () {
+        expect(Printing.safeFilename('a/b/report.pdf'), 'report.pdf');
+      });
+
+      test('drops a windows directory', () {
+        expect(Printing.safeFilename(r'a\b\report.pdf'), 'report.pdf');
+      });
+
+      test('refuses to escape the directory', () {
+        expect(Printing.safeFilename('../../etc/passwd'), 'passwd');
+        expect(Printing.safeFilename('..'), 'document.pdf');
+        expect(Printing.safeFilename('../'), 'document.pdf');
+      });
+
+      test('falls back for a name that names no file', () {
+        expect(Printing.safeFilename(''), 'document.pdf');
+        expect(Printing.safeFilename('.'), 'document.pdf');
+        expect(Printing.safeFilename('   '), 'document.pdf');
+        expect(Printing.safeFilename('a/'), 'document.pdf');
+      });
+
+      test('honours the caller fallback', () {
+        expect(Printing.safeFilename('', fallback: 'other.pdf'), 'other.pdf');
+      });
+    });
+  });
+
+  group('listPrinters', () {
+    test('a platform failure reaches the caller', () async {
+      // Windows answered an empty list when the spooler was stopped, so an app
+      // could not tell 'no printers' from 'the print system is down'.
+      failing.add('listPrinters');
+
+      await expectLater(impl.listPrinters(), throwsA(isA<PlatformException>()));
+    });
+
+    test('a null reply is an empty list, not a null-check error', () async {
+      expect(await impl.listPrinters(), isEmpty);
+    });
+
+    test('a printer without a location or a comment is accepted', () async {
+      replies['listPrinters'] = <Object?>[
+        <String, Object?>{
+          'url': 'ipp://p',
+          'name': 'p',
+          'model': null,
+          'default': false,
+          'available': true,
+        },
+      ];
+
+      final printers = await impl.listPrinters();
+
+      expect(printers, hasLength(1));
+      expect(printers.first.name, 'p');
+      expect(printers.first.location, isNull);
+      expect(printers.first.comment, isNull);
+    });
+  });
+
+  group('printPdf arguments', () {
+    // What reaches the native side decides what the print sheet does: iOS
+    // builds its UIPrintInfo from the output type and the page size, and only
+    // asks Dart for a document up front when 'dynamic' is false.
+    Future<void> layout({
+      Printer? printer,
+      PdfPageFormat format = PdfPageFormat.a4,
+      bool dynamicLayout = true,
+      OutputType outputType = OutputType.generic,
+    }) async {
+      final result = impl.layoutPdf(
+        printer,
+        (PdfPageFormat format) async => Uint8List(0),
+        'document.pdf',
+        format,
+        dynamicLayout,
+        false,
+        outputType,
+        false,
+        false,
+      );
+      await pumpEventQueue();
+      await fromPlatform('onCompleted', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'completed': true,
+      });
+      await result;
+    }
+
+    test('the output type crosses the channel as its index', () async {
+      await layout(outputType: OutputType.grayscale);
+
+      expect(calls.last.arguments['outputType'], OutputType.grayscale.index);
+      expect(
+        OutputType.grayscale.index,
+        2,
+        reason: 'the native side reads an index',
+      );
+    });
+
+    test('a static layout is requested as dynamic: false', () async {
+      await layout(dynamicLayout: false);
+
+      expect(calls.last.arguments['dynamic'], isFalse);
+    });
+
+    test('a landscape format keeps its own axes', () async {
+      await layout(format: PdfPageFormat.a4.landscape);
+
+      expect(
+        calls.last.arguments['width'],
+        greaterThan(calls.last.arguments['height']),
+      );
+    });
+
+    test('directPrintPdf names its printer', () async {
+      const printer = Printer(url: 'ipp://printer', name: 'printer');
+      await layout(printer: printer, dynamicLayout: false);
+
+      final args = calls.last.arguments;
+      expect(args['printer'], 'ipp://printer');
+      expect(args['name'], 'document.pdf');
+      expect(args['dynamic'], isFalse);
+      expect(args['width'], PdfPageFormat.a4.width);
+      expect(args['marginLeft'], PdfPageFormat.a4.marginLeft);
+    });
+
+    test('a failed job start makes the future throw', () async {
+      // What the iOS side now reports when print(to:) or present() refuses.
+      final result = impl.layoutPdf(
+        const Printer(url: 'ipp://printer', name: 'printer'),
+        (PdfPageFormat format) async => Uint8List(0),
+        'document',
+        PdfPageFormat.a4,
+        false,
+        false,
+        OutputType.generic,
+        false,
+        false,
+      );
+      final expectation = expectLater(
+        result,
+        throwsA('Unable to start the print job'),
+      );
+      await pumpEventQueue();
+
+      await fromPlatform('onCompleted', <String, dynamic>{
+        'job': jobOf('printPdf'),
+        'completed': false,
+        'error': 'Unable to start the print job',
+      });
+
+      await expectation;
     });
   });
 }

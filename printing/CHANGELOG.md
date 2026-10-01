@@ -1,5 +1,57 @@
 # Changelog
 
+## 5.16.0
+
+- Fix roll and undefined page formats sending `double.infinity` over the method channel, which no platform can represent: Android substituted its unknown-size sentinel and laid the document out for Letter, iOS produced NaN margins that ended up as a `NaN` MediaBox, and Windows cast the length into a negative 16-bit field. An unspecified axis is now sent as `0`, meaning 'use the printer's paper for this axis', and each backend treats it that way
+- `PdfPreview` now gives a roll format a real height from the page it rasterized while keeping the requested width exactly, so roll printing works from the preview on every backend
+- A page size or margin reported back by a platform that is not finite is repaired instead of reaching the document
+- Fix the Android media-size match rejecting every candidate for a large page, because the tolerance arithmetic overflowed, and never matching a custom finite format
+- Fix the `PdfPreview` share button calling `onPrinted` instead of `onShared`, which left `onShared` as dead code. Apps that relied on `onPrinted` firing for a share must move that handler to `onShared`
+- Fix a null-check crash when the preview rebuilds while a share is in flight: the share action read its iPad popover anchor after awaiting the document, by which time its element had been replaced. The anchor is now read before the await, from the context passed to the action
+- `PdfShareAction` now reports a failure through `onShareError` and as a `FlutterError` instead of letting it escape as an unhandled asynchronous error, matching the print action. `PdfPreview` gained an `onShareError` parameter to receive it
+- `PdfPreviewActionBounds.childKey` and its `bounds` getter are deprecated in favour of `boundsOf(context)`; `bounds` now answers `Rect.zero` rather than throwing when the key is detached
+- `Printing.sharePdf` now treats `filename` as a file name rather than a path: any directory part is dropped, and a name that identifies no file falls back to `document.pdf`. Every backend pasted the string onto a temp directory, so a name containing a separator silently shared nothing on most platforms and aborted the Linux plugin
+- `Printing.sharePdf` now answers `false` when the platform reports no share instead of reading a missing reply as success, and the Android, iOS, macOS, Linux and Windows backends report whether the file was written and the share sheet actually presented
+- Fix the shared document being left behind in the temp directory on iOS and macOS. The copy is now deleted once the share sheet is done with it
+- Fix the Android share granting write access to the shared file, and stale entries accumulating in the share directory
+- Fix the Linux share ignoring every write error, and leaving a forked copy of the application running when `xdg-open` is missing
+- Fix `Printing.layoutPdf` and `Printing.directPrintPdf` never completing on Linux when the document could not be built: `cancel_job` was an empty function, so the future stayed pending, the print dialog stayed alive and everything the job owned leaked. Every Linux job now reports exactly one result, whatever ends it
+- Fix Linux leaking one file descriptor and one document-sized memfd per print, which made a long-running app fail with 'Too many open files' after about a thousand prints
+- Fix a failed spool write still sending a truncated document to the Linux printer, and reporting a second result for the same job
+- Fix Linux never freeing a print job: one leaked per print and per dialog cancel. A cancelled dialog is also destroyed rather than hidden
+- Fix the Linux print dialog's printer and page setup being released although they were never acquired, which corrupted their reference counts and crashed the app on a later dialog print
+- A Linux print to a queue that accepts no PDF, or with no printer selected, reports that instead of continuing with a null printer
+- Fix Windows reporting a successful print for a job that was never spooled. `StartDoc`, `StartPage`, `EndPage` and `EndDoc` are all checked, so `Printing.layoutPdf` now returns false, or throws with the system's message, where it used to return true: cancelling the Print to PDF save dialog, a printer out of paper, access denied and a stopped spooler were all silent successes. A cancellation completes with false rather than throwing
+- A failed Windows job aborts the document it opened instead of leaving a half-open job in the queue, and releases its device context and DEVMODE blocks on every path
+- Fix `Printing.listPrinters` answering an empty list on Windows when the print system had failed, so an app could not tell that from a machine with no printers. It now reports the failure, and a printer added while the list was being read no longer loses the whole list
+- Fix Windows leaking the default-printer name buffer on every `listPrinters` failure
+- Fix the classic Windows print dialog leaking one native job object per cancel
+- `Printing.listPrinters` answers an empty list rather than throwing a null-check error when a platform reports no printer list at all
+- Fix an app that depends on printing and another pdfium plugin failing to configure with 'Build step for pdfium failed: 1', or silently building against the other plugin's pdfium. The Windows and Linux CMake cache entries are now `PRINTING_PDFIUM_VERSION` and `PRINTING_PDFIUM_ARCH`, and the download, source and build trees live under printing's own binary directory instead of `${CMAKE_BINARY_DIR}/pdfium-*`. An app that overrides the version or architecture must use the new names
+- Fix the Windows and Linux CMake configure failing with 'string sub-command REPLACE requires at least four arguments' when the app scaffold does not define `FLUTTER_TARGET_PLATFORM`; the architecture now falls back to x64
+- Fix `Printing.sharePdf` opening nothing on Android in a background or cached `FlutterEngine` with no Activity. The chooser now carries `FLAG_ACTIVITY_NEW_TASK` when the plugin is bound to the application context, and is unchanged when an Activity is attached
+- `Printing.info().canPrint` is now false on Android while no Activity is attached, because `PrintManager` refuses any other context. `Printing.layoutPdf` there completes with a message naming the Activity requirement instead of an anonymous `PlatformException` carrying a raw framework message
+- Fix the Android plugin dropping its method-call handler when the Activity is destroyed, which turned every later call in a surviving engine into a `MissingPluginException`. It now falls back to the application context
+- No Android framework exception escapes the plugin's method-call handler any more; each one is reported as a `printing` PlatformException naming the call that failed
+- Fix Android retaining the last Activity, its Window and its FlutterView for the lifetime of the process after a single print, raster, HTML conversion or share: `PrintingJob` kept the `PrintManager` in a static field, and `PrintManager` holds its Context. The print service is now resolved where it is used and never stored
+- Fix the Android system print dialog sitting on 'Preparing preview' with no message when the `onLayout` callback throws. A failure is now reported to the print framework as a failure, carrying the message from Dart, instead of as a cancellation, which dropped it
+- Fix the Android print preview hanging when the document could not be written into the print spooler - a full disk, or a descriptor closed because the dialog was dismissed. The write now reports a result on every path, so `Printing.layoutPdf` completes instead of waiting for ever
+- Each Android print job now delivers exactly one result to Dart and exactly one terminal callback to the print framework, whatever ends it
+- Annotations - highlights, comments, ink, stamps and form widget appearances - are now drawn on iOS and macOS, in `Printing.raster`, `PdfPreview` and printed output. They were silently missing, because the Apple backends ran only the page content stream; Windows and Linux already drew them. Annotations carrying the Hidden flag stay hidden
+- Fix a PDF whose MediaBox or CropBox origin is not (0, 0) rastering and printing displaced and clipped on iOS and macOS
+- Fix iOS and macOS disagreeing about the pixel size of the same document: macOS sized the raster from the media box and iOS from the crop box. Both now use the crop box, matching Windows and Linux. **macOS raster sizes change for any document with a crop box smaller than its media box**
+- Fix a rotated page losing a pixel from one axis when rastered on iOS and macOS; raster sizes are rounded rather than truncated
+- A page larger than the paper is now scaled to fit rather than clipped
+- The iOS and macOS podspec deployment targets are raised to 13.0 and 10.15, which is what the Swift package manifests already declared
+- Fix `Printing.directPrintPdf` with `dynamicLayout: false` never asking for the document on iOS and handing AirPrint an empty job, so nothing printed. The job now starts only once the document has arrived
+- Fix the iOS print sheet opening portrait for a landscape format, and always using the generic output type, when `dynamicLayout` is false. The orientation and `outputType` a caller asks for are now used on both paths. **Static-layout sheets now open landscape for a landscape format**
+- An iOS print job that cannot be started - the sheet refuses to present, or the printer refuses the job - now reports that, instead of leaving the future pending
+- Each iOS print job reports exactly one result to Dart
+- Fix `Printing.convertHtml` on macOS returning a single page about 108pt wide and as tall as the whole document, ignoring the requested page format and losing the margins. It renders through a print operation at the requested paper size now, so a document taller than one page is paginated. **The shape of the macOS output changes, and `@media print` rules now apply**
+- Fix `Printing.convertHtml` on macOS snapshotting the page one second after starting the load, whatever state it was in: HTML pulling a slow resource converted truncated and was reported as a success, a failed navigation was also reported as a success, and every conversion took at least a second. The conversion now waits for the load to finish, reports a failed navigation as an error, and falls back to rendering whatever exists only after 30 seconds
+- No temporary file is left behind by a macOS HTML conversion, and exactly one result is reported per call
+- `Printing.listPrinters` on macOS now reports `isDefault`, `isAvailable` and `location`. Every entry used to say `isDefault: false` and `isAvailable: true`, so a picker could not preselect the default and a paused queue looked printable. `comment` stays null, which `Printer.comment` now documents
+
 ## 5.15.2
 
 - Fix Windows print jobs hanging forever: opening a named printer, a failing Dart layout callback, an unimplemented reply and a reply carrying no document all deleted the job without reporting anything, so `layoutPdf` and `directPrintPdf` waited for a result that could never arrive. Each now reports the failure and releases the printer device context and settings blocks

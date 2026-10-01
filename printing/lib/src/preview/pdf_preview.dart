@@ -50,6 +50,7 @@ class PdfPreview extends StatefulWidget {
     this.onPrinted,
     this.onPrintError,
     this.onShared,
+    this.onShareError,
     this.scrollViewDecoration,
     this.pdfPreviewPageDecoration,
     this.pdfFileName,
@@ -109,6 +110,7 @@ class PdfPreview extends StatefulWidget {
     this.onPrinted,
     this.onPrintError,
     this.onShared,
+    this.onShareError,
     this.scrollViewDecoration,
     this.pdfPreviewPageDecoration,
     this.pdfFileName,
@@ -179,6 +181,9 @@ class PdfPreview extends StatefulWidget {
 
   /// Called if the user shares the pdf document
   final void Function(BuildContext context)? onShared;
+
+  /// Called if an error occurred while sharing the Pdf
+  final void Function(BuildContext context, dynamic error)? onShareError;
 
   /// Decoration of scrollView
   final Decoration? scrollViewDecoration;
@@ -261,12 +266,29 @@ class PdfPreviewState extends State<PdfPreview> {
     final pages = previewWidget.currentState?.pages ?? const [];
     final dpi = previewWidget.currentState?.dpi ?? PdfPageFormat.inch;
 
-    if (!widget.canChangePageFormat && pages.isNotEmpty) {
-      format = PdfPageFormat(
-        pages.first.width * PdfPageFormat.inch / dpi,
-        pages.first.height * PdfPageFormat.inch / dpi,
-        marginAll: 5 * PdfPageFormat.mm,
-      );
+    if (pages.isNotEmpty) {
+      final rasterWidth = pages.first.width * PdfPageFormat.inch / dpi;
+      final rasterHeight = pages.first.height * PdfPageFormat.inch / dpi;
+
+      if (!widget.canChangePageFormat) {
+        format = PdfPageFormat(
+          rasterWidth,
+          rasterHeight,
+          marginAll: 5 * PdfPageFormat.mm,
+        );
+      } else if (!format.width.isFinite || !format.height.isFinite) {
+        // A roll format leaves one axis unspecified, and no platform can
+        // represent that. Keep the axis the user asked for - an 80mm roll
+        // stays 80mm - and take the other from the page just rasterized.
+        format = PdfPageFormat(
+          format.width.isFinite ? format.width : rasterWidth,
+          format.height.isFinite ? format.height : rasterHeight,
+          marginLeft: format.marginLeft.isFinite ? format.marginLeft : 0,
+          marginTop: format.marginTop.isFinite ? format.marginTop : 0,
+          marginRight: format.marginRight.isFinite ? format.marginRight : 0,
+          marginBottom: format.marginBottom.isFinite ? format.marginBottom : 0,
+        );
+      }
     }
 
     return format;
@@ -377,9 +399,13 @@ class PdfPreviewState extends State<PdfPreview> {
       actions.add(
         PdfShareAction(
           filename: widget.pdfFileName,
-          onShared: widget.onPrinted == null
+          // onShared, not onPrinted: sharing used to report itself as a print.
+          onShared: widget.onShared == null
               ? null
-              : () => widget.onPrinted!(context),
+              : () => widget.onShared!(context),
+          onShareError: widget.onShareError == null
+              ? null
+              : (dynamic error) => widget.onShareError!(context, error),
           subject: widget.shareActionExtraSubject,
           emails: widget.shareActionExtraEmails,
           body: widget.shareActionExtraBody,
