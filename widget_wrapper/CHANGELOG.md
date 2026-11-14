@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Remove the unused import of the Material library bundled with the Flutter SDK, deprecated in Flutter 3.50
+
 ## 1.0.4
 
 - Add compatibility with Flutter 3.20.0-7.0.pre.48
