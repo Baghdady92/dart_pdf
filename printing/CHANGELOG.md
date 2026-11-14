@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Breaking: `PdfPreview`, its action widgets and the printer picker dialog now build on the standalone `material_ui` package instead of the Material library bundled with the Flutter SDK, which Flutter 3.50 deprecated. The bundled classes and the package classes are separate types, so the host app has to import `package:material_ui/material_ui.dart` too. In an app still on `package:flutter/material.dart`, `PdfPreview` throws `No MaterialLocalizations found` when it builds its action bar and does not follow the app theme. `material_ui` 1.11 needs Flutter 3.47 / Dart 3.13 or newer. The API of this package takes no Material type, so calls do not change
+
 ## 5.15.2
 
 - Fix Windows print jobs hanging forever: opening a named printer, a failing Dart layout callback, an unimplemented reply and a reply carrying no document all deleted the job without reporting anything, so `layoutPdf` and `directPrintPdf` waited for a result that could never arrive. Each now reports the failure and releases the printer device context and settings blocks

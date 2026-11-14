@@ -61,7 +61,7 @@ flutter run -d macos
 ### Dart PDF Hello World
 
 ```dart
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;

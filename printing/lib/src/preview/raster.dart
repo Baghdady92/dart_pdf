@@ -20,7 +20,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
     show InformationCollector, StringProperty, kIsWeb;
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:pdf/pdf.dart';
 
 import '../platform_js.dart' if (dart.library.io) '../platform_os.dart';
